@@ -11,8 +11,6 @@ import io.netty.channel.socket.SocketChannel
 import io.netty.channel.socket.nio.NioServerSocketChannel
 import io.netty.channel.socket.nio.NioSocketChannel
 import io.netty.handler.codec.http.*
-import io.netty.handler.logging.LogLevel
-import io.netty.handler.logging.LoggingHandler
 import io.netty.handler.ssl.SslContext
 import io.netty.handler.ssl.SslContextBuilder
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory
@@ -31,6 +29,11 @@ fun main(args: Array<String>) {
     val config = GwApp.Config(ssl, port)
     val server = GwApp(config)
     server.listen()
+
+    Runtime.getRuntime().addShutdownHook(Thread {
+        println("Gracefully shutting down")
+        server.stop()
+    })
 }
 
 class GwApp(
@@ -41,7 +44,7 @@ class GwApp(
         val port: Int,
         val serverThreads: Int = 8,
         val clientThreads: Int = 8,
-        val connectionsPerDestintation: Int = 6,
+        val connectionsPerDestintation: Int = 20,
         val preConnectQueueSize: Int = 8
     )
 
@@ -54,15 +57,15 @@ class GwApp(
     private val poolMap = createPoolMap()
 
     private inner class RewriteRules: GwRewriteRules {
-        override fun rewrite(uri: String) =
-            when {
-                uri.startsWith("/github") -> "https://github.com" + uri.substring("/github".length)
-                else -> throw RuntimeException("no rewrite rule")
-            }
+        override fun rewrite(request: HttpRequest): GwRewriteResult {
+            val uri = request.uri()
+            return GwRewriteResult("https://192.30.253.113" + uri, "github.com")
+        }
     }
 
     fun listen() = serverBootstrap
         .bind(config.port)
+        .addListener { println("Listening ${config.port}") }
         .sync()
         .channel()
 
@@ -125,10 +128,22 @@ class GwApp(
             sslCtx?.let { p.addLast(it.newHandler(ch.alloc())) }
             p.addLast(HttpServerCodec())
             p.addLast(HttpServerExpectContinueHandler())
-            p.addLast(LoggingHandler(LogLevel.INFO))
+//            p.addLast(LoggingHandler(LogLevel.INFO))
+            p.addLast(WriteableExceptionHandler())
             p.addLast(GwServerHandler(poolMap,
                 RewriteRules(),
                 config.preConnectQueueSize))
+        }
+
+        inner class WriteableExceptionHandler : ChannelOutboundHandlerAdapter() {
+            override fun write(ctx: ChannelHandlerContext, msg: Any?, promise: ChannelPromise) {
+                if (msg is Throwable) {
+                    ctx.fireExceptionCaught(msg)
+                    promise.setSuccess(null)
+                } else {
+                    super.write(ctx, msg, promise)
+                }
+            }
         }
     }
 

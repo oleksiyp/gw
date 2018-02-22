@@ -2,8 +2,6 @@ package gw
 
 import io.netty.channel.Channel
 import io.netty.channel.ChannelFuture
-import io.netty.handler.codec.http.*
-import io.netty.util.CharsetUtil
 import io.netty.util.concurrent.Future
 import kotlinx.coroutines.experimental.cancelFutureOnCompletion
 import kotlinx.coroutines.experimental.suspendCancellableCoroutine
@@ -34,16 +32,15 @@ class HttpURLParser(val uri: URI) {
 }
 
 
-fun Channel.requestResponse(): GwRequestResponse = attr(GwRequestResponse.attributeKey).get()
+fun Channel.requestResponse(): GwRequestResponse? = attr(GwRequestResponse.attributeKey).get()
 
 suspend fun Future<Channel>.wait(): Channel =
     suspendCancellableCoroutine { cont ->
         val future = this
         cont.cancelFutureOnCompletion(future)
         future.addListener {
-            val channel = future.get()
             if (future.isSuccess) {
-                cont.resume(channel)
+                cont.resume(future.get())
             } else {
                 cont.resumeWithException(future.cause())
             }

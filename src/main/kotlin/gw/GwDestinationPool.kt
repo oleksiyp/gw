@@ -3,6 +3,9 @@ package gw
 import io.netty.bootstrap.Bootstrap
 import io.netty.channel.pool.ChannelHealthChecker
 import io.netty.channel.pool.FixedChannelPool
+import io.netty.util.concurrent.CompleteFuture
+import io.netty.util.concurrent.Future
+import io.netty.util.concurrent.SucceededFuture
 import java.net.InetSocketAddress
 
 class GwDestinationPool(
@@ -14,7 +17,13 @@ class GwDestinationPool(
     FixedChannelPool(
         bootstrap,
         GwPoolHandler(ssl),
-        maxConnections
+        ChannelHealthChecker.ACTIVE,
+        AcquireTimeoutAction.FAIL,
+        1000,
+        maxConnections,
+        2,
+        true,
+        true
     ) {
 
     override fun connectChannel(bs: Bootstrap) = bs.connect(address)

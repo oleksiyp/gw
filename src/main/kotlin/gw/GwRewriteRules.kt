@@ -1,5 +1,7 @@
 package gw
 
+import io.netty.handler.codec.http.HttpRequest
+
 interface GwRewriteRules {
-    fun rewrite(uri: String): String
+    fun rewrite(request: HttpRequest): GwRewriteResult
 }
