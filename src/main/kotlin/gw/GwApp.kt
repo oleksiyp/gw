@@ -71,7 +71,7 @@ class GwApp(
                     ?: throw RuntimeException("Failed to resolve $host")
             val ip = record.address.hostAddress
             println(ip)
-            return GwRewriteResult("https://" + ip + uri, "mail.google.com")
+            return GwRewriteResult("https://" + ip + uri)
         }
     }
 
