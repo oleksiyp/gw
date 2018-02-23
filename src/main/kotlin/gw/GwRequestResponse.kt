@@ -62,10 +62,13 @@ class GwRequestResponse(
     fun sendDownstream(msg: HttpObject) = client.writeAndFlush(msg)
     fun sendUpstream(msg: HttpObject): ChannelFuture {
         if (msg is HttpResponse) {
+            println("$requestInfo ${msg.headers().get(HttpHeaderNames.CONTENT_TYPE)} ${msg.status()}")
             switchState(RESPONSE_SENT)
         }
         return server.writeAndFlush(msg)
     }
+
+    private lateinit var requestInfo: String
 
     fun connectClient(
         request: HttpRequest,
@@ -73,7 +76,7 @@ class GwRequestResponse(
         poolMap: ChannelPoolMap<GwPoolKey, ChannelPool>
     ) {
         val rewriteResult = rewriteRules.rewrite(request)
-        println("${request.protocolVersion()} ${request.method()} ${request.uri()} -> ${rewriteResult.rewrittenUri}")
+        requestInfo = "${request.protocolVersion()} ${request.method()} ${rewriteResult.target.path}"
         pool = poolMap[rewriteResult.poolKey]
         server.config().isAutoRead = false
         val self = this
@@ -81,7 +84,7 @@ class GwRequestResponse(
             try {
                 client = pool.acquire().wait()
 
-                request.headers().set("Host", rewriteResult.targetHost)
+//                request.headers().set("Host", rewriteResult.targetHost)
 
                 client.attr(GwRequestResponse.attributeKey).set(self)
 

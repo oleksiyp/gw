@@ -16,6 +16,8 @@ import io.netty.handler.ssl.SslContextBuilder
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory
 import io.netty.handler.ssl.util.SelfSignedCertificate
 import io.netty.util.AttributeKey
+import org.xbill.DNS.*
+
 
 fun main(args: Array<String>) {
     val ssl = System.getProperty("ssl") != null
@@ -57,9 +59,19 @@ class GwApp(
     private val poolMap = createPoolMap()
 
     private inner class RewriteRules: GwRewriteRules {
+        var resolver = SimpleResolver("8.8.8.8")
+
         override fun rewrite(request: HttpRequest): GwRewriteResult {
             val uri = request.uri()
-            return GwRewriteResult("https://192.30.253.113" + uri, "github.com")
+            val host = request.headers().get("Host")
+            val lookup = Lookup(host)
+            lookup.setResolver(resolver)
+            lookup.run()
+            val record = lookup.answers.firstOrNull() as ARecord?
+                    ?: throw RuntimeException("Failed to resolve $host")
+            val ip = record.address.hostAddress
+            println(ip)
+            return GwRewriteResult("https://" + ip + uri, "mail.google.com")
         }
     }
 
