@@ -10,6 +10,7 @@ import io.netty.channel.pool.ChannelPoolMap
 import io.netty.handler.codec.http.*
 import io.netty.util.AttributeKey
 import kotlinx.coroutines.experimental.launch
+import org.slf4j.LoggerFactory
 import java.io.PrintWriter
 import java.io.StringWriter
 import java.nio.charset.Charset
@@ -22,6 +23,10 @@ class GwRequestResponse(
     private val serverCtx: ChannelHandlerContext,
     preConnectQueueSize: Int
 ) {
+    enum class Direction {
+        UPSTREAM, DOWNSTREAM
+    }
+
     private lateinit var pool: ChannelPool
     private val server = serverCtx.channel()
     private lateinit var client: Channel
@@ -39,10 +44,11 @@ class GwRequestResponse(
     companion object {
         val attributeKey = AttributeKey.newInstance<GwRequestResponse>("requestResponse")
         val utf8 = Charset.forName("UTF-8")
+        val log = LoggerFactory.getLogger(GwRequestResponse::class.java)
     }
 
 
-    fun handleConnectionClose(headers: HttpHeaders, client: Boolean) {
+    fun handleConnectionClose(headers: HttpHeaders, direction: Direction) {
         if (headers.contains(
                 HttpHeaderNames.CONNECTION,
                 HttpHeaderValues.CLOSE,
@@ -51,7 +57,7 @@ class GwRequestResponse(
         ) {
             headers.remove(HttpHeaderNames.CONNECTION)
 
-            if (client) {
+            if (direction == Direction.DOWNSTREAM) {
                 shouldCloseClient = true
             } else {
                 shouldCloseServer = true
@@ -59,14 +65,27 @@ class GwRequestResponse(
         }
     }
 
+    fun setAutoRead(autoRead: Boolean, direction: Direction) {
+        when (direction) {
+            Direction.DOWNSTREAM -> if (CLIENT_INTIALIZED in state()) client.config().isAutoRead = autoRead
+            Direction.UPSTREAM -> server.config().isAutoRead = autoRead
+        }
+    }
+
     fun sendDownstream(msg: HttpObject) = client.writeAndFlush(msg)
+    fun flushDownstream() {
+        if (CLIENT_INTIALIZED in state()) client.flush()
+    }
+
     fun sendUpstream(msg: HttpObject): ChannelFuture {
         if (msg is HttpResponse) {
-            println("$requestInfo ${msg.headers().get(HttpHeaderNames.CONTENT_TYPE)} ${msg.status()}")
+            log.info("$requestInfo ${msg.headers().get(HttpHeaderNames.CONTENT_TYPE)} ${msg.status()}")
             switchState(RESPONSE_SENT)
         }
         return server.writeAndFlush(msg)
     }
+
+    fun flushUpstream() = server.flush()
 
     private lateinit var requestInfo: String
 
@@ -88,16 +107,20 @@ class GwRequestResponse(
 
                 client.attr(GwRequestResponse.attributeKey).set(self)
 
-                handleConnectionClose(request.headers(), false)
+                handleConnectionClose(request.headers(), Direction.UPSTREAM)
 
                 client.writeAndFlush(request)
                     .wait()
 
+                switchState(REQUEST_SENT)
+
                 drainPreConnectQueue()
+
+                flushDownstream()
 
                 server.config().isAutoRead = true
 
-                switchToInitialziedState()
+                switchToInitializedState()
             } catch (e: Throwable) {
                 server.write(e)
             }
@@ -105,9 +128,11 @@ class GwRequestResponse(
 
     }
 
-    private fun switchToInitialziedState() {
+    private fun switchToInitializedState() {
         val wasState = getAndUpdateState {
-            if (contains(CLIENT_CLOSED) || contains(CLIENT_RELEASED_TO_POOL)) {
+            if (contains(CLIENT_CLOSED)
+                || contains(CLIENT_RELEASED_TO_POOL)
+                || contains(SERVER_CLOSED)) {
                 this
             } else {
                 on(CLIENT_INTIALIZED)
@@ -115,6 +140,9 @@ class GwRequestResponse(
         }
         if (CLIENT_CLOSED in wasState) {
             client.close()
+        }
+        if (SERVER_CLOSED in wasState) {
+            server.close()
         }
         if (CLIENT_RELEASED_TO_POOL in wasState) {
             pool.release(client)
@@ -141,8 +169,9 @@ class GwRequestResponse(
         }
     }
 
-    fun exceptionHappened(cause: Throwable, clientSide: Boolean) {
-        if (clientSide) {
+    fun exceptionHappened(cause: Throwable, direction: Direction) {
+        println(cause)
+        if (direction == Direction.DOWNSTREAM) {
             server.write(cause)
             done(true)
             return
@@ -294,6 +323,5 @@ class GwRequestResponse(
             return client.newSucceededFuture()
         }
     }
-
 }
 

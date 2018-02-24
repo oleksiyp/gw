@@ -1,5 +1,7 @@
 package gw
 
+import gw.GwRequestResponse.Direction.*
+import io.netty.buffer.PooledByteBufAllocator
 import io.netty.channel.ChannelHandlerContext
 import io.netty.channel.SimpleChannelInboundHandler
 import io.netty.handler.codec.http.*
@@ -13,16 +15,32 @@ class GwClientHandler : SimpleChannelInboundHandler<HttpObject>() {
                 ?: throw RuntimeException("initialization error")
 
         if (msg is HttpResponse) {
-            reqResp.handleConnectionClose(msg.headers(), true)
+            reqResp.handleConnectionClose(msg.headers(), DOWNSTREAM)
         }
 
         val writeMsgFuture = reqResp.sendUpstream(msg)
-        launch {
-            writeMsgFuture.wait()
-            if (msg is LastHttpContent) {
+        if (msg is LastHttpContent) {
+            launch {
+                writeMsgFuture.wait()
                 reqResp.done()
             }
         }
+    }
+
+    override fun channelWritabilityChanged(ctx: ChannelHandlerContext) {
+        val reqResp = ctx.channel().requestResponse()
+        if (reqResp != null) {
+            reqResp.setAutoRead(ctx.channel().isWritable, UPSTREAM);
+        }
+        super.channelWritabilityChanged(ctx)
+    }
+
+    override fun channelReadComplete(ctx: ChannelHandlerContext) {
+        val reqResp = ctx.channel().requestResponse()
+        if (reqResp != null) {
+            reqResp.flushUpstream()
+        }
+        super.channelReadComplete(ctx)
     }
 
     override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
@@ -31,7 +49,7 @@ class GwClientHandler : SimpleChannelInboundHandler<HttpObject>() {
             ctx.close()
             return
         }
-        reqResp.exceptionHappened(cause, true)
+        reqResp.exceptionHappened(cause, DOWNSTREAM)
     }
 
 

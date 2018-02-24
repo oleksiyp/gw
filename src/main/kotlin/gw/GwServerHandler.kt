@@ -1,5 +1,7 @@
 package gw
 
+import gw.GwRequestResponse.Direction.*
+import io.netty.buffer.PooledByteBufAllocator
 import io.netty.channel.ChannelHandlerContext
 import io.netty.channel.ChannelInboundHandlerAdapter
 import io.netty.channel.pool.ChannelPool
@@ -12,10 +14,6 @@ class GwServerHandler(
     private val rewriteRules: GwRewriteRules,
     val preConnectQueueSize: Int
 ) : ChannelInboundHandlerAdapter() {
-
-    override fun channelReadComplete(ctx: ChannelHandlerContext) {
-        ctx.flush()
-    }
 
     override fun channelRead(ctx: ChannelHandlerContext, msg: Any) {
         if (msg is HttpRequest) {
@@ -39,6 +37,23 @@ class GwServerHandler(
         }
     }
 
+    override fun channelWritabilityChanged(ctx: ChannelHandlerContext) {
+        val reqResp = ctx.channel().requestResponse()
+        if (reqResp != null) {
+            reqResp.setAutoRead(ctx.channel().isWritable, DOWNSTREAM)
+        }
+
+        super.channelWritabilityChanged(ctx)
+    }
+
+    override fun channelReadComplete(ctx: ChannelHandlerContext) {
+        val reqResp = ctx.channel().requestResponse()
+        if (reqResp != null) {
+            reqResp.flushDownstream()
+        }
+        super.channelReadComplete(ctx)
+    }
+
 
     override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
         val reqResp = ctx.channel().requestResponse()
@@ -46,7 +61,7 @@ class GwServerHandler(
             ctx.close()
             return
         }
-        reqResp.exceptionHappened(cause, false)
+        reqResp.exceptionHappened(cause, UPSTREAM)
     }
 }
 

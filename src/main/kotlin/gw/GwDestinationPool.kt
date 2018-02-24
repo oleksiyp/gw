@@ -3,9 +3,6 @@ package gw
 import io.netty.bootstrap.Bootstrap
 import io.netty.channel.pool.ChannelHealthChecker
 import io.netty.channel.pool.FixedChannelPool
-import io.netty.util.concurrent.CompleteFuture
-import io.netty.util.concurrent.Future
-import io.netty.util.concurrent.SucceededFuture
 import java.net.InetSocketAddress
 
 class GwDestinationPool(

@@ -16,6 +16,7 @@ import io.netty.handler.ssl.SslContextBuilder
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory
 import io.netty.handler.ssl.util.SelfSignedCertificate
 import io.netty.util.AttributeKey
+import org.slf4j.LoggerFactory
 import org.xbill.DNS.*
 
 
@@ -33,7 +34,7 @@ fun main(args: Array<String>) {
     server.listen()
 
     Runtime.getRuntime().addShutdownHook(Thread {
-        println("Gracefully shutting down")
+        GwApp.log.info("Gracefully shutting down")
         server.stop()
     })
 }
@@ -47,7 +48,7 @@ class GwApp(
         val serverThreads: Int = 8,
         val clientThreads: Int = 8,
         val connectionsPerDestintation: Int = 20,
-        val preConnectQueueSize: Int = 8
+        val preConnectQueueSize: Int = 20
     )
 
     private val serverGroup = NioEventLoopGroup(1)
@@ -58,7 +59,7 @@ class GwApp(
     private val clientBootstrap: Bootstrap = createClientBootstrap()
     private val poolMap = createPoolMap()
 
-    private inner class RewriteRules: GwRewriteRules {
+    private inner class RewriteRules : GwRewriteRules {
         var resolver = SimpleResolver("8.8.8.8")
 
         override fun rewrite(request: HttpRequest): GwRewriteResult {
@@ -70,14 +71,13 @@ class GwApp(
             val record = lookup.answers.firstOrNull() as ARecord?
                     ?: throw RuntimeException("Failed to resolve $host")
             val ip = record.address.hostAddress
-            println(ip)
             return GwRewriteResult("https://" + ip + uri)
         }
     }
 
     fun listen() = serverBootstrap
         .bind(config.port)
-        .addListener { println("Listening ${config.port}") }
+        .addListener { log.info("Listening ${config.port} ${if (config.ssl) "https" else "http"}") }
         .sync()
         .channel()
 
@@ -108,6 +108,8 @@ class GwApp(
         val bootstrap = Bootstrap()
         bootstrap.attr(sslKeyAttribute, sslCtx)
 
+        bootstrap.option(ChannelOption.TCP_NODELAY, true)
+
         bootstrap
             .group(clientGroup)
             .channel(NioSocketChannel::class.java)
@@ -118,7 +120,8 @@ class GwApp(
     private fun configureSSL(): SslContext? {
         return if (config.ssl) {
             val ssc = SelfSignedCertificate()
-            SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey()).build()
+            SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey())
+                .build()
         } else {
             null
         }
@@ -128,6 +131,7 @@ class GwApp(
     private fun createServerBootstrap(): ServerBootstrap {
         val bootstrap = ServerBootstrap()
         bootstrap.option(ChannelOption.SO_BACKLOG, 1024)
+        bootstrap.childOption(ChannelOption.TCP_NODELAY, true)
         bootstrap.group(serverGroup, serverWorkerGroup)
             .channel(NioServerSocketChannel::class.java)
             .childHandler(ServerInitializer())
@@ -140,11 +144,14 @@ class GwApp(
             sslCtx?.let { p.addLast(it.newHandler(ch.alloc())) }
             p.addLast(HttpServerCodec())
             p.addLast(HttpServerExpectContinueHandler())
-//            p.addLast(LoggingHandler(LogLevel.INFO))
             p.addLast(WriteableExceptionHandler())
-            p.addLast(GwServerHandler(poolMap,
-                RewriteRules(),
-                config.preConnectQueueSize))
+            p.addLast(
+                GwServerHandler(
+                    poolMap,
+                    RewriteRules(),
+                    config.preConnectQueueSize
+                )
+            )
         }
 
         inner class WriteableExceptionHandler : ChannelOutboundHandlerAdapter() {
@@ -161,5 +168,6 @@ class GwApp(
 
     companion object {
         val sslKeyAttribute = AttributeKey.newInstance<SslContext>("sslContext")
+        val log = LoggerFactory.getLogger(GwApp::class.java)
     }
 }
