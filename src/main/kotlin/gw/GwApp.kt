@@ -1,24 +1,38 @@
 package gw
 
-import io.netty.bootstrap.Bootstrap
 import io.netty.bootstrap.ServerBootstrap
 import io.netty.channel.*
 import io.netty.channel.nio.NioEventLoopGroup
-import io.netty.channel.pool.AbstractChannelPoolMap
-import io.netty.channel.pool.ChannelPool
-import io.netty.channel.pool.SimpleChannelPool
 import io.netty.channel.socket.SocketChannel
 import io.netty.channel.socket.nio.NioServerSocketChannel
-import io.netty.channel.socket.nio.NioSocketChannel
-import io.netty.handler.codec.http.*
+import io.netty.handler.codec.http.HttpRequest
+import io.netty.handler.codec.http.HttpServerCodec
+import io.netty.handler.codec.http.HttpServerExpectContinueHandler
+import io.netty.handler.flow.FlowControlHandler
 import io.netty.handler.ssl.SslContext
 import io.netty.handler.ssl.SslContextBuilder
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory
 import io.netty.handler.ssl.util.SelfSignedCertificate
-import io.netty.util.AttributeKey
 import org.slf4j.LoggerFactory
-import org.xbill.DNS.*
+import org.xbill.DNS.ARecord
+import org.xbill.DNS.Lookup
+import org.xbill.DNS.SimpleResolver
 
+private class RewriteRules : GwRewriteRules {
+    var resolver = SimpleResolver("8.8.8.8")
+
+    override fun rewrite(request: HttpRequest): List<GwRewriteResult> {
+        val uri = request.uri()
+        val host = request.headers().get("Host")
+        val lookup = Lookup(host)
+        lookup.setResolver(resolver)
+        lookup.run()
+        val record = lookup.answers.firstOrNull() as ARecord?
+                ?: throw RuntimeException("Failed to resolve $host")
+        val ip = record.address.hostAddress
+        return listOf(GwRewriteResult("https://" + ip + uri))
+    }
+}
 
 fun main(args: Array<String>) {
     val ssl = System.getProperty("ssl") != null
@@ -30,7 +44,7 @@ fun main(args: Array<String>) {
     )
 
     val config = GwApp.Config(ssl, port)
-    val server = GwApp(config)
+    val server = GwApp(config, RewriteRules())
     server.listen()
 
     Runtime.getRuntime().addShutdownHook(Thread {
@@ -40,40 +54,24 @@ fun main(args: Array<String>) {
 }
 
 class GwApp(
-    val config: Config
+    val config: Config,
+    val rewriteRules: GwRewriteRules
 ) {
     data class Config(
         val ssl: Boolean,
         val port: Int,
         val serverThreads: Int = 8,
         val clientThreads: Int = 8,
-        val connectionsPerDestintation: Int = 20,
-        val preConnectQueueSize: Int = 20
+        val preConnectQueueSize: Int = 20,
+        val clientConfig: GwClient.Config = GwClient.Config()
     )
 
     private val serverGroup = NioEventLoopGroup(1)
     private val serverWorkerGroup = NioEventLoopGroup(config.serverThreads)
     private val sslCtx: SslContext? = configureSSL()
+    private val clientSslCtx = configureClientSSL()
     private val serverBootstrap = createServerBootstrap()
-    private val clientGroup = NioEventLoopGroup(config.clientThreads)
-    private val clientBootstrap: Bootstrap = createClientBootstrap()
-    private val poolMap = createPoolMap()
 
-    private inner class RewriteRules : GwRewriteRules {
-        var resolver = SimpleResolver("8.8.8.8")
-
-        override fun rewrite(request: HttpRequest): GwRewriteResult {
-            val uri = request.uri()
-            val host = request.headers().get("Host")
-            val lookup = Lookup(host)
-            lookup.setResolver(resolver)
-            lookup.run()
-            val record = lookup.answers.firstOrNull() as ARecord?
-                    ?: throw RuntimeException("Failed to resolve $host")
-            val ip = record.address.hostAddress
-            return GwRewriteResult("https://" + ip + uri)
-        }
-    }
 
     fun listen() = serverBootstrap
         .bind(config.port)
@@ -81,52 +79,25 @@ class GwApp(
         .sync()
         .channel()
 
-
     fun stop() {
         serverGroup.shutdownGracefully()
         serverWorkerGroup.shutdownGracefully()
-        clientGroup.shutdownGracefully()
     }
 
-    private fun createPoolMap(): AbstractChannelPoolMap<GwPoolKey, ChannelPool> {
-        return object : AbstractChannelPoolMap<GwPoolKey, ChannelPool>() {
-            override fun newPool(gwPoolKey: GwPoolKey): SimpleChannelPool {
-                return GwDestinationPool(
-                    clientBootstrap,
-                    config.connectionsPerDestintation,
-                    gwPoolKey.address,
-                    gwPoolKey.ssl
-                )
-            }
-        }
-    }
-
-    private fun createClientBootstrap(): Bootstrap {
-        val sslCtx = SslContextBuilder.forClient()
+    private fun configureClientSSL(): SslContext {
+        return SslContextBuilder.forClient()
             .trustManager(InsecureTrustManagerFactory.INSTANCE).build()
-
-        val bootstrap = Bootstrap()
-        bootstrap.attr(sslKeyAttribute, sslCtx)
-
-        bootstrap.option(ChannelOption.TCP_NODELAY, true)
-
-        bootstrap
-            .group(clientGroup)
-            .channel(NioSocketChannel::class.java)
-
-        return bootstrap
     }
+
 
     private fun configureSSL(): SslContext? {
-        return if (config.ssl) {
-            val ssc = SelfSignedCertificate()
-            SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey())
-                .build()
-        } else {
-            null
+        if (!config.ssl) {
+            return null
         }
+        val ssc = SelfSignedCertificate()
+        return SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey())
+            .build()
     }
-
 
     private fun createServerBootstrap(): ServerBootstrap {
         val bootstrap = ServerBootstrap()
@@ -139,17 +110,18 @@ class GwApp(
     }
 
     private inner class ServerInitializer() : ChannelInitializer<SocketChannel>() {
+        val clientInitializer = GwClientInitializer(clientSslCtx, config.clientConfig)
+
         public override fun initChannel(ch: SocketChannel) {
             val p = ch.pipeline()
+            p.addLast(clientInitializer)
             sslCtx?.let { p.addLast(it.newHandler(ch.alloc())) }
             p.addLast(HttpServerCodec())
             p.addLast(HttpServerExpectContinueHandler())
             p.addLast(WriteableExceptionHandler())
             p.addLast(
                 GwServerHandler(
-                    poolMap,
-                    RewriteRules(),
-                    config.preConnectQueueSize
+                    rewriteRules
                 )
             )
         }
@@ -167,7 +139,6 @@ class GwApp(
     }
 
     companion object {
-        val sslKeyAttribute = AttributeKey.newInstance<SslContext>("sslContext")
         val log = LoggerFactory.getLogger(GwApp::class.java)
     }
 }

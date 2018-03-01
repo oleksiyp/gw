@@ -1,10 +1,12 @@
 package gw
 
-import gw.GwRequestResponse.Direction.*
-import io.netty.buffer.PooledByteBufAllocator
+import gw.GwRequestResponse.Direction.DOWNSTREAM
+import gw.GwRequestResponse.Direction.UPSTREAM
 import io.netty.channel.ChannelHandlerContext
 import io.netty.channel.SimpleChannelInboundHandler
-import io.netty.handler.codec.http.*
+import io.netty.handler.codec.http.HttpObject
+import io.netty.handler.codec.http.HttpResponse
+import io.netty.handler.codec.http.LastHttpContent
 import io.netty.util.ReferenceCountUtil
 import kotlinx.coroutines.experimental.launch
 
@@ -18,9 +20,9 @@ class GwClientHandler : SimpleChannelInboundHandler<HttpObject>() {
             reqResp.handleConnectionClose(msg.headers(), DOWNSTREAM)
         }
 
-        val writeMsgFuture = reqResp.sendUpstream(msg)
+        val writeMsgFuture = reqResp.send(msg, UPSTREAM)
         if (msg is LastHttpContent) {
-            launch {
+            launch(reqResp.dispatcher) {
                 writeMsgFuture.wait()
                 reqResp.done()
             }
@@ -28,18 +30,12 @@ class GwClientHandler : SimpleChannelInboundHandler<HttpObject>() {
     }
 
     override fun channelWritabilityChanged(ctx: ChannelHandlerContext) {
-        val reqResp = ctx.channel().requestResponse()
-        if (reqResp != null) {
-            reqResp.setAutoRead(ctx.channel().isWritable, UPSTREAM);
-        }
+        ctx.channel().requestResponse()?.flowControl()
         super.channelWritabilityChanged(ctx)
     }
 
     override fun channelReadComplete(ctx: ChannelHandlerContext) {
-        val reqResp = ctx.channel().requestResponse()
-        if (reqResp != null) {
-            reqResp.flushUpstream()
-        }
+        ctx.channel().requestResponse()?.flush(UPSTREAM)
         super.channelReadComplete(ctx)
     }
 
@@ -51,6 +47,4 @@ class GwClientHandler : SimpleChannelInboundHandler<HttpObject>() {
         }
         reqResp.exceptionHappened(cause, DOWNSTREAM)
     }
-
-
 }

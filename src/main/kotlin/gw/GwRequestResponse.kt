@@ -1,45 +1,38 @@
 package gw
 
-import gw.GwRequestReponseState.Flag.*
-import io.netty.buffer.ByteBufAllocator
+import gw.GwRequestResponse.Direction.DOWNSTREAM
+import gw.GwRequestResponse.Direction.UPSTREAM
 import io.netty.channel.Channel
-import io.netty.channel.ChannelFuture
 import io.netty.channel.ChannelHandlerContext
 import io.netty.channel.pool.ChannelPool
 import io.netty.channel.pool.ChannelPoolMap
 import io.netty.handler.codec.http.*
 import io.netty.util.AttributeKey
+import kotlinx.coroutines.experimental.Job
+import kotlinx.coroutines.experimental.asCoroutineDispatcher
 import kotlinx.coroutines.experimental.launch
 import org.slf4j.LoggerFactory
-import java.io.PrintWriter
-import java.io.StringWriter
 import java.nio.charset.Charset
 import java.util.*
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicReference
 
 class GwRequestResponse(
-    private val serverCtx: ChannelHandlerContext,
-    preConnectQueueSize: Int
+    private val serverCtx: ChannelHandlerContext
 ) {
     enum class Direction {
         UPSTREAM, DOWNSTREAM
     }
 
-    private lateinit var pool: ChannelPool
     private val server = serverCtx.channel()
-    private lateinit var client: Channel
-    private val state = AtomicInteger()
-    private val preConnectQueue = AtomicReference<Queue<HttpContent>>(
-        LinkedBlockingQueue<HttpContent>(preConnectQueueSize)
-    )
+    private var client: Channel? = null
+    private var clientPool: ChannelPool? = null
+    private var connectJob: Job? = null
 
-    @Volatile
     private var shouldCloseClient = false
-
-    @Volatile
     private var shouldCloseServer = false
+
+    private var responseSent = false
+
+    val dispatcher = server.eventLoop().asCoroutineDispatcher()
 
     companion object {
         val attributeKey = AttributeKey.newInstance<GwRequestResponse>("requestResponse")
@@ -57,7 +50,7 @@ class GwRequestResponse(
         ) {
             headers.remove(HttpHeaderNames.CONNECTION)
 
-            if (direction == Direction.DOWNSTREAM) {
+            if (direction == DOWNSTREAM) {
                 shouldCloseClient = true
             } else {
                 shouldCloseServer = true
@@ -65,263 +58,140 @@ class GwRequestResponse(
         }
     }
 
-    fun setAutoRead(autoRead: Boolean, direction: Direction) {
+    private val clientQueue = ArrayDeque<HttpObject>(2)
+
+    fun send(msg: HttpObject, direction: Direction) =
         when (direction) {
-            Direction.DOWNSTREAM -> if (CLIENT_INTIALIZED in state()) client.config().isAutoRead = autoRead
-            Direction.UPSTREAM -> server.config().isAutoRead = autoRead
+            DOWNSTREAM -> {
+                val cl = client
+                if (cl == null) {
+                    clientQueue.add(msg)
+                    server.newSucceededFuture()
+                } else {
+                    while (clientQueue.isNotEmpty()){
+                        cl.write(clientQueue.remove())
+                    }
+                    cl.write(msg)
+                }
+            }
+            UPSTREAM -> {
+                if (msg is HttpResponse) {
+                    responseSent = true
+                }
+                server.write(msg)
+            }
+        }
+
+    fun flush(direction: Direction) {
+        when (direction) {
+            DOWNSTREAM -> client?.flush()
+            UPSTREAM -> server.flush()
         }
     }
-
-    fun sendDownstream(msg: HttpObject) = client.writeAndFlush(msg)
-    fun flushDownstream() {
-        if (CLIENT_INTIALIZED in state()) client.flush()
-    }
-
-    fun sendUpstream(msg: HttpObject): ChannelFuture {
-        if (msg is HttpResponse) {
-            log.info("$requestInfo ${msg.headers().get(HttpHeaderNames.CONTENT_TYPE)} ${msg.status()}")
-            switchState(RESPONSE_SENT)
-        }
-        return server.writeAndFlush(msg)
-    }
-
-    fun flushUpstream() = server.flush()
-
-    private lateinit var requestInfo: String
 
     fun connectClient(
         request: HttpRequest,
-        rewriteRules: GwRewriteRules,
-        poolMap: ChannelPoolMap<GwPoolKey, ChannelPool>
+        poolMap: ChannelPoolMap<GwPoolKey, ChannelPool>,
+        results: List<GwRewriteResult>
     ) {
-        val rewriteResult = rewriteRules.rewrite(request)
-        requestInfo = "${request.protocolVersion()} ${request.method()} ${rewriteResult.target.path}"
-        pool = poolMap[rewriteResult.poolKey]
-        server.config().isAutoRead = false
-        val self = this
-        launch {
+        connectJob = launch(dispatcher) {
             try {
-                client = pool.acquire().wait()
+                val (channel, pool) = connectOneByOne(results, poolMap)
 
-//                request.headers().set("Host", rewriteResult.targetHost)
+                client = channel
+                clientPool = pool
 
-                client.attr(GwRequestResponse.attributeKey).set(self)
+                channel.attr(GwRequestResponse.attributeKey).set(this@GwRequestResponse)
 
-                handleConnectionClose(request.headers(), Direction.UPSTREAM)
+                handleConnectionClose(request.headers(), UPSTREAM)
+                send(request, DOWNSTREAM)
+                flush(DOWNSTREAM)
+                flowControl()
+            } catch (ex: Throwable) {
+                server.write(ex)
+            }
+        }
+    }
 
-                client.writeAndFlush(request)
-                    .wait()
+    private suspend fun connectOneByOne(
+        results: List<GwRewriteResult>,
+        poolMap: ChannelPoolMap<GwPoolKey, ChannelPool>
+    ): Pair<Channel, ChannelPool> {
+        var ex: Throwable? = null
+        for (result in results) {
+            try {
+                val pool = poolMap[result.poolKey]
+                val channel = pool.acquire().wait()
 
-                switchState(REQUEST_SENT)
-
-                drainPreConnectQueue()
-
-                flushDownstream()
-
-                server.config().isAutoRead = true
-
-                switchToInitializedState()
+                return Pair(channel, pool)
             } catch (e: Throwable) {
-                server.write(e)
+                ex = e
             }
         }
-
-    }
-
-    private fun switchToInitializedState() {
-        val wasState = getAndUpdateState {
-            if (contains(CLIENT_CLOSED)
-                || contains(CLIENT_RELEASED_TO_POOL)
-                || contains(SERVER_CLOSED)) {
-                this
-            } else {
-                on(CLIENT_INTIALIZED)
-            }
-        }
-        if (CLIENT_CLOSED in wasState) {
-            client.close()
-        }
-        if (SERVER_CLOSED in wasState) {
-            server.close()
-        }
-        if (CLIENT_RELEASED_TO_POOL in wasState) {
-            pool.release(client)
-        }
-    }
-
-    fun enqueueIfConnecting(msg: HttpContent): Boolean {
-        val queue = preConnectQueue.get()
-                ?: return false
-
-        if (!queue.offer(msg)) {
-            throw RuntimeException("pre connect queue full")
-        }
-
-        return true
-    }
-
-    private suspend fun drainPreConnectQueue() {
-        val queue = preConnectQueue.getAndSet(null)
-        var qMsg = queue.poll()
-        while (qMsg != null) {
-            sendDownstream(qMsg).wait()
-            qMsg = queue.poll()
-        }
+        throw ex!!
     }
 
     fun exceptionHappened(cause: Throwable, direction: Direction) {
-        println(cause)
-        if (direction == Direction.DOWNSTREAM) {
-            server.write(cause)
-            done(true)
-            return
-        }
-
-        if (!switchState(RESPONSE_SENT)) {
-            serverClose()
-            done(true)
-            return
-        }
-
-        val respose = errorResponse(serverCtx.alloc(), cause)
-        launch {
-            server.writeAndFlush(respose).wait()
-            serverClose()
-        }
-
-        if (state().contains(CLIENT_INTIALIZED)) {
-            client.write(cause)
-        }
-    }
-
-
-    private fun errorResponse(
-        alloc: ByteBufAllocator,
-        cause: Throwable
-    ): HttpResponse {
-        val buf = alloc.buffer()
-        val sw = StringWriter()
-        val pw = PrintWriter(sw)
-        pw.println(
-            """
-            |<html>
-            |<head>
-            |    <title>gw 502</title>
-            |</head>
-            |<body>
-            |    <h2>gw 502 Bad Gateway: ${cause.message}</h2>
-            |<pre>""".trimMargin()
-        )
-        pw.println(stackTrace(cause.stackTrace))
-        var nextCause = cause.cause
-        var prevCause: Throwable? = cause
-        while (nextCause != null && prevCause != nextCause) {
-            pw.println("<h3>${nextCause.message}</h3>")
-            pw.println(stackTrace(nextCause.stackTrace))
-            prevCause = nextCause
-            nextCause = nextCause.cause
-        }
-
-        buf.writeCharSequence(sw.toString(), utf8)
-
-        val response = DefaultFullHttpResponse(
-            HttpVersion.HTTP_1_1,
-            HttpResponseStatus.BAD_GATEWAY,
-            buf
-        )
-
-        response.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.CLOSE)
-        response.headers().set(
-            HttpHeaderNames.CONTENT_LENGTH,
-            buf.writerIndex() - buf.readerIndex()
-        )
-        response.headers().set(
-            HttpHeaderNames.CONTENT_TYPE,
-            "text/html; charset=utf-8"
-        )
-        return response
-    }
-
-    fun stackTrace(stackTrace: Array<StackTraceElement>): String {
-        fun columnSize(block: StackTraceElement.() -> String) =
-            stackTrace.map(block).map { it.length }.max() ?: 0
-
-        fun StackTraceElement.fileLine() =
-            "($fileName:$lineNumber)${if (isNativeMethod) "N" else ""}"
-
-        fun spaces(n: Int) = if (n < 0) "" else (1..n).map { " " }.joinToString("")
-        fun columnRight(s: String, sz: Int) = spaces(sz - s.length) + s
-        fun columnLeft(s: String, sz: Int) = s + spaces(sz - s.length)
-
-        fun String.pkg(): String {
-            val idx = lastIndexOf('.')
-            return substring(0, if (idx == -1) 0 else idx)
-        }
-
-        fun String.cls(): String {
-            val idx = lastIndexOf('.')
-            return substring(if (idx == -1) 0 else 1 + idx)
-        }
-
-        val maxPkgNameLen = columnSize { className.pkg() }
-        val maxClassNameLen = columnSize { className.cls() }
-        val maxMethodLen = columnSize { methodName }
-        val maxThirdColumn = columnSize { fileLine() }
-
-        return stackTrace.map {
-            columnLeft(it.className.pkg(), maxPkgNameLen) + " " +
-                    columnRight(it.className.cls(), maxClassNameLen) + "." +
-                    columnLeft(it.methodName, maxMethodLen) + " " +
-                    columnLeft(it.fileLine(), maxThirdColumn)
-        }.joinToString("\n")
-    }
-
-
-    private fun state() = GwRequestReponseState(state.get())
-    private fun getAndUpdateState(
-        transition: GwRequestReponseState.() -> GwRequestReponseState
-    ): GwRequestReponseState {
-        var prev: GwRequestReponseState
-        var next: GwRequestReponseState
-        do {
-            prev = GwRequestReponseState(state.get())
-            next = transition(prev)
-            if (prev == next) {
-                break
+        if (direction == DOWNSTREAM) {
+            launch(dispatcher) {
+                done(closeClient = true)
+                server.write(cause)
             }
-        } while (!state.compareAndSet(prev.flags, next.flags))
-        return prev
-    }
-
-    private fun switchState(flag: GwRequestReponseState.Flag) = !getAndUpdateState(flag).contains(flag)
-
-    private fun getAndUpdateState(flag: GwRequestReponseState.Flag) =
-        getAndUpdateState { on(flag) }
-
-    fun done(close: Boolean = false) {
-        if (shouldCloseClient or close) {
-            clientClose().sync()
+            return
         }
 
-        if (switchState(CLIENT_RELEASED_TO_POOL) && state().contains(CLIENT_INTIALIZED)) {
-            pool.release(client)
+        if (responseSent) {
+            launch(dispatcher) {
+                done(closeServer = true, closeClient = true)
+            }
+            return
         }
+        responseSent = true
+
+        val respose = GwErrorResponseBuilder.buildErrorResponse(serverCtx.alloc(), cause)
+
+        val future = server.writeAndFlush(respose)
+        launch(dispatcher) {
+            future.wait()
+            server.close()
+        }
+
+        client?.write(cause)
     }
 
-    private fun serverClose(): ChannelFuture {
-        if (switchState(SERVER_CLOSED)) {
-            return server.close()
-        } else {
-            return server.newSucceededFuture()
-        }
+
+    fun flowControl() {
+        client?.config()?.isAutoRead = server.isWritable
+        client?.isWritable?.let { server.config().isAutoRead = it }
     }
 
-    private fun clientClose(): ChannelFuture {
-        if (switchState(CLIENT_CLOSED) && state().contains(CLIENT_INTIALIZED)) {
-            return client.close()
-        } else {
-            return client.newSucceededFuture()
+
+    suspend fun done(closeServer: Boolean = false, closeClient: Boolean = false) {
+        connectJob?.cancel()
+        connectJob?.join()
+
+        client?.config()?.isAutoRead = true
+        server.config().isAutoRead = true
+
+        client?.attr(GwRequestResponse.attributeKey)?.set(null)
+        server.attr(GwRequestResponse.attributeKey).set(null)
+
+        if (shouldCloseClient or closeClient) {
+            client?.close()?.wait()
         }
+        if (shouldCloseServer or closeServer) {
+            server.close()
+        }
+        releaseToPool()
     }
+
+    private fun releaseToPool() {
+        if (client != null) {
+            clientPool?.release(client)
+        }
+        clientPool = null
+        client = null
+    }
+
 }
 

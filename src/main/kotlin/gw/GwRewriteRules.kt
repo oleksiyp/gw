@@ -3,5 +3,5 @@ package gw
 import io.netty.handler.codec.http.HttpRequest
 
 interface GwRewriteRules {
-    fun rewrite(request: HttpRequest): GwRewriteResult
+    fun rewrite(request: HttpRequest): List<GwRewriteResult>
 }
