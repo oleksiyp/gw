@@ -1,11 +1,12 @@
-package gw
+package gw.error
 
+import gw.proxy.GwRequestResponse
 import io.netty.buffer.ByteBufAllocator
 import io.netty.handler.codec.http.*
 import java.io.PrintWriter
 import java.io.StringWriter
 
-object GwErrorResponseBuilder {
+object BadGatewayResponseBuilder {
     fun buildErrorResponse(
         alloc: ByteBufAllocator,
         cause: Throwable

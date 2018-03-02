@@ -1,9 +1,10 @@
-package gw
+package gw.rewrite
 
+import gw.client.HttpClientPoolKey
 import java.net.InetSocketAddress
 import java.net.URI
 
-class GwRewriteResult(
+class ProxyRewriteResult(
     val rewrittenUri: String
 ) {
     val target = URI(rewrittenUri)
@@ -11,5 +12,7 @@ class GwRewriteResult(
     val targetPort = parser.port
     val targetAddr = InetSocketAddress(parser.host, targetPort)
     val secure = target.scheme.equals("https", ignoreCase = true)
-    val poolKey = GwPoolKey(targetAddr, secure)
+    val poolKey = HttpClientPoolKey(targetAddr, secure)
+
+    override fun toString() = rewrittenUri
 }

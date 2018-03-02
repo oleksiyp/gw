@@ -1,8 +1,10 @@
-package gw
+package gw.client
 
+import gw.proxy.ProxyPoolChannelInitializer
 import io.netty.bootstrap.Bootstrap
 import io.netty.channel.ChannelOption
 import io.netty.channel.EventLoop
+import io.netty.channel.epoll.EpollSocketChannel
 import io.netty.channel.pool.AbstractChannelPoolMap
 import io.netty.channel.pool.ChannelPool
 import io.netty.channel.pool.SimpleChannelPool
@@ -10,10 +12,9 @@ import io.netty.channel.socket.nio.NioSocketChannel
 import io.netty.handler.ssl.SslContext
 import io.netty.util.AbstractReferenceCounted
 import io.netty.util.AttributeKey
-import io.netty.util.ReferenceCounted
 import org.slf4j.LoggerFactory
 
-class GwClient(
+class HttpClient(
     private val eventLoop: EventLoop,
     private val sslCtx: SslContext,
     private val config: Config
@@ -34,19 +35,19 @@ class GwClient(
 
         bootstrap
             .group(eventLoop)
-            .channel(NioSocketChannel::class.java)
+            .channel(EpollSocketChannel::class.java)
 
         return bootstrap
     }
 
-    private fun createPoolMap(): AbstractChannelPoolMap<GwPoolKey, ChannelPool> {
-        return object : AbstractChannelPoolMap<GwPoolKey, ChannelPool>() {
-            override fun newPool(gwPoolKey: GwPoolKey): SimpleChannelPool {
-                return GwDestinationPool(
+    private fun createPoolMap(): AbstractChannelPoolMap<HttpClientPoolKey, ChannelPool> {
+        return object : AbstractChannelPoolMap<HttpClientPoolKey, ChannelPool>() {
+            override fun newPool(poolKey: HttpClientPoolKey): SimpleChannelPool {
+                return HttpClientPool(
                     clientBootstrap,
                     config.connectionsPerDestintation,
-                    gwPoolKey.address,
-                    gwPoolKey.ssl
+                    poolKey.address,
+                    ProxyPoolChannelInitializer(poolKey.ssl)
                 )
             }
         }
@@ -60,9 +61,9 @@ class GwClient(
     }
 
     companion object {
-        val attributeKey = AttributeKey.newInstance<GwClient>("client")
+        val attributeKey = AttributeKey.newInstance<HttpClient>("client")
         val sslKeyAttribute = AttributeKey.newInstance<SslContext>("clientSslContext")
-        val log = LoggerFactory.getLogger(GwClientInitializer::class.java)
+        val log = LoggerFactory.getLogger(HttpClientInitializer::class.java)
     }
 
 }
