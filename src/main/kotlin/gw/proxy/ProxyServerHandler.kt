@@ -4,68 +4,95 @@ import gw.client.HttpClient
 import gw.rewrite.ProxyRewriteRules
 import io.netty.channel.ChannelHandlerContext
 import io.netty.channel.ChannelInboundHandlerAdapter
+import io.netty.channel.SimpleChannelInboundHandler
 import io.netty.handler.codec.http.*
+import io.netty.util.AttributeKey
 import io.netty.util.ReferenceCountUtil
-import kotlinx.coroutines.experimental.asCoroutineDispatcher
 import kotlinx.coroutines.experimental.launch
+import org.slf4j.LoggerFactory
 
 class ProxyServerHandler(
     private val rewriteRules: ProxyRewriteRules
-) : ChannelInboundHandlerAdapter() {
-
-    override fun channelActive(ctx: ChannelHandlerContext) {
-        val pipeline = HttpPipeline(ctx.channel(), ctx.alloc())
-
-        ctx.channel().attr(HttpPipeline.attributeKey).set(pipeline)
-    }
+) : SimpleChannelInboundHandler<HttpObject>() {
 
     override fun channelInactive(ctx: ChannelHandlerContext) {
-        val pipeline = ctx.channel().attr(HttpPipeline.attributeKey).getAndSet(null)
-        launch(ctx.channel().eventLoop().asCoroutineDispatcher()) {
-            pipeline.abort()
+        val reqResponse = ctx.requestResponseNullable ?: return
+        ctx.requestResponseNullable = null
+        launch(reqResponse.dispatcher) {
+            reqResponse.closeServer()
         }
     }
 
-    override fun channelRead(ctx: ChannelHandlerContext, msg: Any) {
-        val pipeline = ctx.httpPipelineSeries()
+    override fun channelRead0(ctx: ChannelHandlerContext, msg: HttpObject) {
+        if (ctx.skip) {
+            return
+        }
+
         if (msg is HttpRequest) {
+            if (!canHandleNextRequest(ctx)) {
+                ctx.skip = true
+                ctx.requestResponse.shouldCloseServer = true
+                return
+            }
+
             val client = ctx.channel().attr(HttpClient.attributeKey).get()
             val results = rewriteRules.rewrite(msg)
 
-            val closeServer = if (!HttpUtil.isKeepAlive(msg)) {
-                HttpUtil.setKeepAlive(msg, true)
-                true
-            } else {
-                false
-            }
-
-            val reqResp = pipeline.pushRequestResponse(closeServer)
-            if (results.isEmpty()) {
-                throw RuntimeException("empty rewrite result")
-            }
-
-            ReferenceCountUtil.retain(msg)
-
-            pipeline.flowControl()
-            reqResp.connectClient(msg, client.poolMap, results)
-
-        } else if (msg is HttpObject) {
-            ReferenceCountUtil.retain(msg)
-            pipeline.sendClient(msg)
+            val newReqResp = ProxyHttpRequestResponse(ctx.channel(), ctx.alloc())
+            ctx.requestResponse = newReqResp
+            newReqResp.connectClient(msg, client.poolMap, results)
         }
+
+        ReferenceCountUtil.retain(msg)
+        ctx.requestResponse.sendClient(msg)
+    }
+
+    private fun canHandleNextRequest(
+        ctx: ChannelHandlerContext
+    ): Boolean {
+        val reqResp = ctx.requestResponseNullable ?: return true
+
+        if (reqResp.canHandleNextRequest()) {
+            return true
+        }
+
+        return false
     }
 
     override fun channelWritabilityChanged(ctx: ChannelHandlerContext) {
-        ctx.httpPipelineSeries().flowControl()
+        if (ctx.skip) {
+            return
+        }
+
+        ctx.requestResponse.flowControl()
         super.channelWritabilityChanged(ctx)
     }
 
     override fun channelReadComplete(ctx: ChannelHandlerContext) {
-        ctx.httpPipelineSeries().flushClient()
+        if (ctx.skip) {
+            return
+        }
+
+        ctx.requestResponseNullable?.flushClient()
         super.channelReadComplete(ctx)
     }
 
     override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
-        ctx.httpPipelineSeries().serverExceptionHappened(cause)
+        val requestResponse = ctx.requestResponseNullable
+        if (requestResponse == null) {
+            log.error("Server-side channel error. Bad state", cause)
+        } else {
+            requestResponse.serverExceptionHappened(cause)
+        }
+    }
+
+    companion object {
+        val skipAttributeKey = AttributeKey.newInstance<Boolean>("skip")
+
+        var ChannelHandlerContext.skip: Boolean
+            get() = channel().attr(skipAttributeKey).get() ?: false
+            set(value) = channel().attr(skipAttributeKey).set(value)
+
+        val log = LoggerFactory.getLogger(ProxyServerHandler::class.java)
     }
 }

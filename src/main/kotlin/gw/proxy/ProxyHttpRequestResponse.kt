@@ -4,6 +4,7 @@ import gw.error.BadGatewayResponseBuilder
 import gw.client.HttpClientPoolKey
 import gw.rewrite.ProxyRewriteResult
 import gw.wait
+import io.netty.buffer.ByteBufAllocator
 import io.netty.channel.Channel
 import io.netty.channel.ChannelFuture
 import io.netty.channel.ChannelHandlerContext
@@ -18,68 +19,50 @@ import org.slf4j.LoggerFactory
 import java.nio.charset.Charset
 import java.util.*
 
-class GwRequestResponse(
-    val pipeline: HttpPipeline
+class ProxyHttpRequestResponse(
+    val server: Channel,
+    val alloc: ByteBufAllocator
 ) {
     private var client: Channel? = null
     private var clientPool: ChannelPool? = null
     private var connectJob: Job? = null
 
     private var shouldCloseClient = false
+    var shouldCloseServer = false
 
     private var responseSent = false
-
-    private val server
-        get() = pipeline.server
-
-    private var active: Boolean = false
 
     val dispatcher = server.eventLoop().asCoroutineDispatcher()
 
     companion object {
-        val attributeKey = AttributeKey.newInstance<GwRequestResponse>("requestResponse")
-        val utf8 = Charset.forName("UTF-8")
-        val log = LoggerFactory.getLogger(GwRequestResponse::class.java)
+        val attributeKey = AttributeKey.newInstance<ProxyHttpRequestResponse>("requestResponse")
+        val log = LoggerFactory.getLogger(ProxyHttpRequestResponse::class.java)
     }
 
     private val clientQueue = ArrayDeque<HttpObject>(2)
-    private val serverQueue = ArrayDeque<HttpObject>(2)
 
-    fun sendServerWhenActive(msg: HttpObject): ChannelFuture {
-        return if (!active) {
-            serverQueue.add(msg)
-            server.newSucceededFuture()
-        } else {
-            drainServerQueue()
-            sendServer(msg)
-        }
-    }
+    private var finishOk: Boolean = false
 
-    private fun drainServerQueue() {
-        val doFlush = serverQueue.isNotEmpty()
-        while (serverQueue.isNotEmpty()) {
-            sendServer(serverQueue.remove())
-        }
-        if (doFlush) {
-            server.flush()
-        }
-    }
-
-    private fun sendServer(msg: HttpObject): ChannelFuture {
+    fun sendServer(msg: HttpObject): ChannelFuture {
         if (msg is HttpResponse) {
             responseSent = true
+            if (!HttpUtil.isKeepAlive(msg)) {
+                HttpUtil.setKeepAlive(msg, true)
+                shouldCloseClient = true
+            }
         }
         val future = server.write(msg)
         if (msg is LastHttpContent) {
+            finishOk = true
             launch(dispatcher) {
                 future.wait()
-                pipeline.popRequestResponse()
+                finish()
             }
         }
         return future
     }
 
-    fun sendClientWhenConnected(msg: HttpObject): ChannelFuture {
+    fun sendClient(msg: HttpObject): ChannelFuture {
         val cl = client
         return if (cl == null) {
             clientQueue.add(msg)
@@ -113,21 +96,21 @@ class GwRequestResponse(
         poolMap: ChannelPoolMap<HttpClientPoolKey, ChannelPool>,
         results: List<ProxyRewriteResult>
     ) {
+        flowControl()
         connectJob = launch(dispatcher) {
             try {
                 val (channel, pool) = connectOneByOne(results, poolMap)
+                channel.attr(ProxyHttpRequestResponse.attributeKey).set(this@ProxyHttpRequestResponse)
 
                 client = channel
                 clientPool = pool
 
                 if (!HttpUtil.isKeepAlive(request)) {
                     HttpUtil.setKeepAlive(request, true)
-                    shouldCloseClient = true
+                    shouldCloseServer = true
                 }
 
-                channel.attr(GwRequestResponse.attributeKey).set(this@GwRequestResponse)
-                pipeline.flowControl()
-                channel.writeAndFlush(request)
+                flowControl()
                 drainClientQueue(channel)
             } catch (ex: Throwable) {
                 server.write(ex)
@@ -153,56 +136,75 @@ class GwRequestResponse(
         throw ex!!
     }
 
-    fun clientExceptionHappened(cause: Throwable) {
-        launch(dispatcher) {
-            if (responseSent) {
-                log.error("Client-side channel error. Aborting HTTP pipeline", cause)
-                pipeline.abort()
-            } else {
-                log.error("Client-side channel error. Sending error response", cause)
-                val respose = BadGatewayResponseBuilder.buildErrorResponse(pipeline.alloc, cause)
-                sendServerWhenActive(respose)
-                sendServerWhenActive(DefaultLastHttpContent())
-                finish(true)
-            }
-        }
-    }
-
-
-    fun setClientAutoRead(readClient: Boolean) {
-        client?.config()?.isAutoRead = readClient
+    fun flowControl() {
+        server.config().isAutoRead = client?.isWritable ?: true
+        client?.config()?.isAutoRead = server.isWritable
     }
 
     suspend fun finish(closeClient: Boolean = false) {
         connectJob?.cancel()
         connectJob?.join()
 
-        client?.config()?.isAutoRead = true
-        client?.attr(attributeKey)?.set(null)
-        if (shouldCloseClient or closeClient) {
-            client?.close()?.wait()
-        }
-
-        releaseToPool()
-    }
-
-    private fun releaseToPool() {
-        if (client != null) {
-            clientPool?.release(client)
-        }
-        clientPool = null
+        val ch = client
         client = null
+
+        if (ch != null) {
+            releaseToPool(ch, shouldCloseClient or closeClient)
+        }
+
+        server.flush()
+
+        if (shouldCloseServer) {
+            server.close().wait()
+        }
     }
 
-    val isWriteable: Boolean get() = if (active) client?.isWritable ?: false else false
-
-    fun activate() {
-        active = true
-        drainServerQueue()
+    private suspend fun releaseToPool(ch: Channel, close: Boolean) {
+        ch.config().isAutoRead = true
+        ch.attr(attributeKey).set(null)
+        if (close) {
+            ch.close().wait()
+        }
+        clientPool?.release(ch)
+        clientPool = null
     }
+
+    fun clientExceptionHappened(cause: Throwable) {
+        launch(dispatcher) {
+            if (responseSent) {
+                log.error("Client-side channel error. Response sent. Closing connections", cause)
+                closeServer()
+            } else {
+                log.error("Client-side channel error. Sending error response", cause)
+                val respose = BadGatewayResponseBuilder.buildErrorResponse(alloc, cause)
+                sendServer(respose)
+                sendServer(DefaultLastHttpContent())
+                finish(true)
+            }
+        }
+    }
+
+    fun serverExceptionHappened(cause: Throwable) {
+        log.error("Server-side channel error. Closing connections", cause)
+        launch {
+            closeServer()
+        }
+    }
+
+    suspend fun closeServer() {
+        finish(true)
+        server.close()
+    }
+
+    fun canHandleNextRequest() = finishOk && !shouldCloseServer
+
 }
 
+var ChannelHandlerContext.requestResponseNullable: ProxyHttpRequestResponse?
+    get () = channel().attr(ProxyHttpRequestResponse.attributeKey).get()
+    set(value) = channel().attr(ProxyHttpRequestResponse.attributeKey).set(value)
 
-fun ChannelHandlerContext.requestResponse(): GwRequestResponse =
-    channel().attr(GwRequestResponse.attributeKey)?.get()
+var ChannelHandlerContext.requestResponse: ProxyHttpRequestResponse
+    get () = channel().attr(ProxyHttpRequestResponse.attributeKey).get()
             ?: throw RuntimeException("bad state")
+    set(value) = channel().attr(ProxyHttpRequestResponse.attributeKey).set(value)

@@ -8,7 +8,6 @@ import io.netty.channel.epoll.EpollSocketChannel
 import io.netty.channel.pool.AbstractChannelPoolMap
 import io.netty.channel.pool.ChannelPool
 import io.netty.channel.pool.SimpleChannelPool
-import io.netty.channel.socket.nio.NioSocketChannel
 import io.netty.handler.ssl.SslContext
 import io.netty.util.AbstractReferenceCounted
 import io.netty.util.AttributeKey

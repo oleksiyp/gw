@@ -8,20 +8,25 @@ import io.netty.util.ReferenceCountUtil
 class ProxyClientHandler : SimpleChannelInboundHandler<HttpObject>() {
     public override fun channelRead0(ctx: ChannelHandlerContext, msg: HttpObject) {
         ReferenceCountUtil.retain(msg)
-        ctx.requestResponse().sendServerWhenActive(msg)
+        ctx.requestResponse.sendServer(msg)
     }
 
     override fun channelWritabilityChanged(ctx: ChannelHandlerContext) {
-        ctx.requestResponse().pipeline.flowControl()
+        ctx.requestResponse.flowControl()
         super.channelWritabilityChanged(ctx)
     }
 
     override fun channelReadComplete(ctx: ChannelHandlerContext) {
-        ctx.requestResponse().flushServer()
+        ctx.requestResponseNullable?.flushServer()
         super.channelReadComplete(ctx)
     }
 
     override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
-        ctx.requestResponse().clientExceptionHappened(cause)
+        val requestResponse = ctx.requestResponseNullable
+        if (requestResponse == null) {
+            ProxyServerHandler.log.error("Client-side channel error. Bad state", cause)
+        } else {
+            requestResponse.clientExceptionHappened(cause)
+        }
     }
 }

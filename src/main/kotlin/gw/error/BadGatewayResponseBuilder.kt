@@ -1,12 +1,14 @@
 package gw.error
 
-import gw.proxy.GwRequestResponse
 import io.netty.buffer.ByteBufAllocator
 import io.netty.handler.codec.http.*
 import java.io.PrintWriter
 import java.io.StringWriter
+import java.nio.charset.Charset
 
 object BadGatewayResponseBuilder {
+    private val utf8 = Charset.forName("UTF-8")
+
     fun buildErrorResponse(
         alloc: ByteBufAllocator,
         cause: Throwable
@@ -34,7 +36,7 @@ object BadGatewayResponseBuilder {
             nextCause = nextCause.cause
         }
 
-        buf.writeCharSequence(sw.toString(), GwRequestResponse.utf8)
+        buf.writeCharSequence(sw.toString(), utf8)
 
         val response = DefaultFullHttpResponse(
             HttpVersion.HTTP_1_1,
