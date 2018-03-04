@@ -3,9 +3,9 @@ package gw.proxy
 import gw.client.HttpClient
 import gw.rewrite.ProxyRewriteRules
 import io.netty.channel.ChannelHandlerContext
-import io.netty.channel.ChannelInboundHandlerAdapter
 import io.netty.channel.SimpleChannelInboundHandler
-import io.netty.handler.codec.http.*
+import io.netty.handler.codec.http.HttpObject
+import io.netty.handler.codec.http.HttpRequest
 import io.netty.util.AttributeKey
 import io.netty.util.ReferenceCountUtil
 import kotlinx.coroutines.experimental.launch
@@ -36,10 +36,11 @@ class ProxyServerHandler(
             }
 
             val client = ctx.channel().attr(HttpClient.attributeKey).get()
-            val results = rewriteRules.rewrite(msg)
-
             val newReqResp = ProxyHttpRequestResponse(ctx.channel(), ctx.alloc())
             ctx.requestResponse = newReqResp
+
+            val results = rewriteRules.rewrite(msg)
+
             newReqResp.connectClient(msg, client.poolMap, results)
         }
 
