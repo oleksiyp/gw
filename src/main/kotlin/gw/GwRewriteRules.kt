@@ -7,7 +7,7 @@ import org.xbill.DNS.ARecord
 import org.xbill.DNS.Lookup
 import org.xbill.DNS.SimpleResolver
 
-class GwRewriteRules : ProxyRewriteRules {
+class GwRewriteRules(val ssl: Boolean) : ProxyRewriteRules {
     var resolver = SimpleResolver("8.8.8.8")
 
     override fun rewrite(request: HttpRequest): List<ProxyRewriteResult> {
@@ -19,6 +19,7 @@ class GwRewriteRules : ProxyRewriteRules {
         val record = lookup.answers.firstOrNull() as ARecord?
                 ?: throw RuntimeException("Failed to resolve $host")
         val ip = record.address.hostAddress
-        return listOf(ProxyRewriteResult("https://" + ip + uri))
+        val prefix = if (ssl) "https://" else "http://"
+        return listOf(ProxyRewriteResult(prefix + ip + uri))
     }
 }

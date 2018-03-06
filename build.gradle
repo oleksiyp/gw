@@ -17,7 +17,12 @@ version '1.0-SNAPSHOT'
 apply plugin: 'kotlin'
 apply plugin: 'com.github.johnrengelman.shadow'
 
+ext.junitJupiterVersion = '5.0.3'
+ext.junitVintageVersion = '4.12.0'
+ext.mockKVersion = '1.7.10-SNAPSHOT'
+
 repositories {
+    mavenLocal()
     mavenCentral()
 }
 
@@ -29,6 +34,9 @@ dependencies {
     compile group: 'dnsjava', name: 'dnsjava', version: '2.1.8'
     compile 'org.slf4j:slf4j-api:1.7.25'
     compile 'ch.qos.logback:logback-classic:1.2.3'
+    testCompile "io.mockk:mockk:$mockKVersion"
+    testCompile "org.junit.jupiter:junit-jupiter-api:$junitJupiterVersion"
+    testCompile "org.junit.jupiter:junit-jupiter-engine:$junitJupiterVersion"
 }
 
 compileKotlin {

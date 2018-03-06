@@ -8,9 +8,6 @@ import io.netty.bootstrap.ServerBootstrap
 import io.netty.channel.*
 import io.netty.channel.epoll.EpollEventLoopGroup
 import io.netty.channel.epoll.EpollServerSocketChannel
-import io.netty.channel.epoll.EpollSocketChannel
-import io.netty.channel.nio.NioEventLoopGroup
-import io.netty.channel.socket.nio.NioServerSocketChannel
 import io.netty.handler.ssl.SslContext
 import io.netty.handler.ssl.SslContextBuilder
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory
@@ -19,21 +16,15 @@ import io.netty.util.concurrent.DefaultThreadFactory
 import org.slf4j.LoggerFactory
 
 fun main(args: Array<String>) {
-    val ssl = System.getProperty("ssl") != null
-    val port = Integer.parseInt(
-        System.getProperty(
-            "port",
-            if (ssl) "8443" else "8080"
-        )
-    )
-
-    val config = GwApp.Config(ssl, port)
-    val server = GwApp(config, GwRewriteRules())
-    server.listen()
+    val httpsServer = GwApp(GwApp.Config(true, 443), GwRewriteRules(true))
+    httpsServer.listen()
+    val httpServer = GwApp(GwApp.Config(false, 80), GwRewriteRules(false))
+    httpServer.listen()
 
     Runtime.getRuntime().addShutdownHook(Thread {
         GwApp.log.info("Gracefully shutting down")
-        server.stop()
+        httpsServer.stop()
+        httpServer.stop()
     })
 }
 
@@ -79,8 +70,7 @@ class GwApp(
             return null
         }
         val ssc = SelfSignedCertificate()
-        return SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey())
-            .build()
+        return SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey()).build()
     }
 
     private fun createServerBootstrap(): ServerBootstrap {
